@@ -46,7 +46,6 @@ const config = {
   model: env("OPENCLAW_MODEL", "anthropic/claude-haiku-4-5"),
   thinking: env("OPENCLAW_THINKING", "minimal"),
   openclawTimeoutSec: envInt("OPENCLAW_TIMEOUT_SEC", 12),
-  useLocal: env("OPENCLAW_USE_LOCAL", "0") === "1",
   routerAgent: env("OPENCLAW_ROUTER_AGENT", "minecraft-router"),
   helperAgent: env("OPENCLAW_HELPER_AGENT", "minecraft-helper"),
   modAgent: env("OPENCLAW_MOD_AGENT", "minecraft-moderation"),
@@ -62,9 +61,6 @@ const config = {
   ambientMaxMs: envInt("AMBIENT_MAX_INTERVAL_MS", 3_600_000),
   ambientContextLines: envInt("AMBIENT_CONTEXT_LINES", 8),
 };
-
-const helperPrompt = fs.readFileSync(path.resolve(__dirname, "..", "prompts", "helper.md"), "utf8");
-const modPrompt = fs.readFileSync(path.resolve(__dirname, "..", "prompts", "moderation.md"), "utf8");
 
 const CHAT_RE = /^<([^>]+)>\s+(.+)$/;
 const PM_RE = /^\[CHAT_PM\]\s+from=([^\s]+)\s+from_uuid=([^\s]+)\s+cmd=([^\s]+)\s+to=([^\s]+)\s+message=(.*)$/;
@@ -262,16 +258,15 @@ function extractAssistantLine(raw) {
 }
 
 function sessionKeyForMessage(msg) {
-  const player = String(msg.player || "unknown").toLowerCase();
-  return msg.kind === "pm" ? `mc-pm:${player}` : `mc-public:${player}`;
+  const player = String(msg.player || "unknown")
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]/g, "_");
+  return msg.kind === "pm" ? `mc_pm_${player}` : `mc_public_${player}`;
 }
 
 async function runOpenClaw(agent, message, sessionKey) {
-  const args = ["agent"];
-  if (config.useLocal) {
-    args.push("--local");
-  }
-  args.push(
+  const args = [
+    "agent",
     "--agent",
     agent,
     "--session-id",
@@ -280,18 +275,16 @@ async function runOpenClaw(agent, message, sessionKey) {
     config.thinking,
     "--message",
     message
-  );
-  const { stdout } = await execFileAsync(config.cli, args, {
+  ];
+  const { stdout, stderr } = await execFileAsync(config.cli, args, {
     maxBuffer: 1024 * 1024,
     timeout: Math.max(5, config.openclawTimeoutSec) * 1000,
   });
+  const errText = String(stderr || "");
+  if (errText.includes("falling back to embedded") || errText.includes("pairing required")) {
+    throw new Error("gateway_only_path_failed");
+  }
   return (stdout || "").trim();
-}
-
-function isSimplePresencePing(text) {
-  const t = String(text || "").toLowerCase().trim();
-  if (!t) return false;
-  return /^(are you there[\?\!]*|you there[\?\!]*|hello|hi|yo|check|test)$/.test(t);
 }
 
 async function ensureRcon() {
@@ -359,19 +352,10 @@ async function routeAndHandle(msg) {
   const chatSessionKey = sessionKeyForMessage(msg);
 
   if (!MODERATION_RE.test(stripped)) {
-    // Skip LLM round-trip for simple "are you there" pings.
-    if (isSimplePresencePing(stripped)) {
-      await replyAsHerobrine(msg, "present.");
-      return;
-    }
-    const helperInput = `${helperPrompt}\n\nplayer=${msg.player}\nmessage=${stripped}`;
-    try {
-      const helperRaw = await runOpenClaw(config.helperAgent, helperInput, chatSessionKey);
-      const oneLine = extractAssistantLine(helperRaw);
-      if (oneLine) await replyAsHerobrine(msg, oneLine);
-    } catch {
-      await replyAsHerobrine(msg, "the fog is loud. ask again.");
-    }
+    const helperInput = `player=${msg.player}\nmessage=${stripped}`;
+    const helperRaw = await runOpenClaw(config.helperAgent, helperInput, chatSessionKey);
+    const oneLine = extractAssistantLine(helperRaw);
+    if (oneLine) await replyAsHerobrine(msg, oneLine);
     return;
   }
 
@@ -384,15 +368,9 @@ async function routeAndHandle(msg) {
   const evidence = getRecent(target)
     .map((m) => `[${m.timestamp}] <${m.player}> ${m.message}`)
     .join("\n");
-  const modInput = `${modPrompt}\n\nrequester=${msg.player}\ntarget=${target}\nmessage=${stripped}\n\nevidence:\n${evidence || "(none)"}`;
-  const modSessionKey = `mc-mod:${target.toLowerCase()}`;
-  let modRaw = "";
-  try {
-    modRaw = await runOpenClaw(config.modAgent, modInput, modSessionKey);
-  } catch {
-    await replyAsHerobrine(msg, "the signal is thin. try again.");
-    return;
-  }
+  const modInput = `requester=${msg.player}\ntarget=${target}\nmessage=${stripped}\n\nevidence:\n${evidence || "(none)"}`;
+  const modSessionKey = `mc_mod_${target.toLowerCase().replace(/[^a-z0-9_-]/g, "_")}`;
+  const modRaw = await runOpenClaw(config.modAgent, modInput, modSessionKey);
   const decision = jsonFromText(modRaw);
   if (!decision || decision.action === "ignore") {
     const resp = decision?.response || "nothing to see.";
@@ -431,8 +409,11 @@ async function maybeSendAmbientLine() {
   if (context.length === 0) return;
 
   const contextLines = context.map((m) => `<${m.player}> ${m.message}`).join("\n");
-  const prompt = `${helperPrompt}\n\nWrite one ambient Herobrine line for the whole server based on this recent chat context.\nDo not mention policy. Keep it one line.\n\nRecent chat:\n${contextLines}`;
-  const raw = await runOpenClaw(config.helperAgent, prompt, "mc-ambient:global");
+  const prompt =
+    "Write one ambient Herobrine line for the whole server based on this recent chat context. " +
+    "Do not mention policy. Keep it one line.\n\nRecent chat:\n" +
+    contextLines;
+  const raw = await runOpenClaw(config.helperAgent, prompt, "mc_ambient_global");
   const oneLine = extractAssistantLine(raw);
   if (!oneLine) return;
   await sendTellraw("@a", `[Herobrine] ${oneLine}`);
