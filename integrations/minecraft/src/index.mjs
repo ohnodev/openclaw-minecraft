@@ -61,13 +61,6 @@ const config = {
   ambientMaxMs: envInt("AMBIENT_MAX_INTERVAL_MS", 3_600_000),
   ambientContextLines: envInt("AMBIENT_CONTEXT_LINES", 8),
   dedupeWindowMs: envInt("DEDUPE_WINDOW_MS", 30_000),
-  quickAckEnabled: env("QUICK_ACK_ENABLED", "1") !== "0",
-  quickAckText: env("QUICK_ACK_TEXT", "heard."),
-  typewriterEnabled: env("TYPEWRITER_ENABLED", "1") !== "0",
-  typewriterMinDelayMs: envInt("TYPEWRITER_MIN_DELAY_MS", 30),
-  typewriterMaxDelayMs: envInt("TYPEWRITER_MAX_DELAY_MS", 90),
-  typewriterPunctPauseMs: envInt("TYPEWRITER_PUNCT_PAUSE_MS", 220),
-  typewriterMaxChars: envInt("TYPEWRITER_MAX_CHARS", 220),
 };
 
 const CHAT_RE = /^<([^>]+)>\s+(.+)$/;
@@ -93,7 +86,6 @@ const processedLineHashes = new Set();
 let watchDebounceTimer = null;
 const inFlightPlayers = new Set();
 const recentPromptByPlayer = new Map();
-const typewriterStreamByTarget = new Map();
 
 function hashLine(line) {
   return crypto.createHash("sha1").update(line).digest("hex");
@@ -357,65 +349,6 @@ async function sendWhisper(player, text) {
   await conn.send(`msg ${player} ${oneLine}`);
 }
 
-async function sendActionbar(target, text) {
-  const conn = await ensureRcon();
-  const json = JSON.stringify({ text: String(text || "") });
-  await conn.send(`title ${target} actionbar ${json}`);
-}
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
-}
-
-function randomInt(min, max) {
-  if (max <= min) return min;
-  return min + Math.floor(Math.random() * (max - min + 1));
-}
-
-function clampTypewriterText(fullText) {
-  const oneLine = String(fullText || "").replace(/\r?\n/g, " ").trim();
-  const maxChars = Math.max(20, config.typewriterMaxChars);
-  return oneLine.length <= maxChars ? oneLine : oneLine.slice(0, maxChars);
-}
-
-function beginTypewriterStream(target) {
-  const nextId = (typewriterStreamByTarget.get(target) ?? 0) + 1;
-  typewriterStreamByTarget.set(target, nextId);
-  return nextId;
-}
-
-function isTypewriterCancelled(target, streamId) {
-  return typewriterStreamByTarget.get(target) !== streamId;
-}
-
-async function streamTypewriter(target, fullText) {
-  const streamId = beginTypewriterStream(target);
-  const text = clampTypewriterText(fullText);
-  if (!text) return;
-
-  const minDelay = Math.max(5, config.typewriterMinDelayMs);
-  const maxDelay = Math.max(minDelay, config.typewriterMaxDelayMs);
-  const punctPause = Math.max(0, config.typewriterPunctPauseMs);
-
-  let rendered = "";
-  for (const ch of text) {
-    if (isTypewriterCancelled(target, streamId)) return;
-    rendered += ch;
-    await sendActionbar(target, rendered);
-
-    const delay = randomInt(minDelay, maxDelay);
-    const extra = /[.,!?…]/.test(ch) ? punctPause : 0;
-    await sleep(delay + extra);
-  }
-}
-
-async function sendQuickAck(msg) {
-  if (!config.quickAckEnabled) return;
-  const text = String(config.quickAckText || "").trim();
-  if (!text) return;
-  await sendWhisper(msg.player, `[Herobrine] ${text}`);
-}
-
 async function warnPlayer(player, reason) {
   const conn = await ensureRcon();
   const json = JSON.stringify([
@@ -443,14 +376,6 @@ function isMessageForHerobrine(message) {
 async function replyAsHerobrine(msg, text) {
   const line = `[Herobrine] ${text}`;
   const target = msg.kind === "pm" ? msg.player : "@a";
-
-  if (config.typewriterEnabled) {
-    try {
-      await streamTypewriter(target, line);
-    } catch (err) {
-      console.warn("[minecraft-sidecar] typewriter failed, falling back to final message:", err);
-    }
-  }
 
   if (msg.kind === "pm") {
     await sendWhisper(target, line);
@@ -566,7 +491,6 @@ async function tick() {
     if (!canRespond(msg.player)) continue;
     inFlightPlayers.add(playerKey);
     try {
-      await sendQuickAck(msg);
       await routeAndHandle(msg);
     } catch (err) {
       console.error("[minecraft-sidecar] handler error:", err);
