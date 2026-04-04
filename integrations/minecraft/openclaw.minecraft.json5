@@ -3,7 +3,7 @@
   agents: {
     defaults: {
       model: {
-        primary: "anthropic/claude-3-5-haiku-latest",
+        primary: "anthropic/claude-haiku-4-5",
       },
       workspace: "~/.openclaw/workspace",
     },

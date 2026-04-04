@@ -44,6 +44,6 @@ Moderation agent must return JSON:
 
 ## Notes
 
-- Default model is `anthropic/claude-3-5-haiku-latest`.
+- Default model is `anthropic/claude-haiku-4-5`.
 - If you want longer memory, configure OpenClaw sessions for the `minecraft-*` agents in your `openclaw.json`.
 - This is intentionally simple and easy to iterate.

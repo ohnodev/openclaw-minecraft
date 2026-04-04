@@ -39,7 +39,7 @@ const config = {
   pollMs: envInt("POLL_INTERVAL_MS", 5000),
   tag: env("HEROBRINE_TAG", "@Herobrine"),
   cli: env("OPENCLAW_CLI", "openclaw"),
-  model: env("OPENCLAW_MODEL", "anthropic/claude-3-5-haiku-latest"),
+  model: env("OPENCLAW_MODEL", "anthropic/claude-haiku-4-5"),
   routerAgent: env("OPENCLAW_ROUTER_AGENT", "minecraft-router"),
   helperAgent: env("OPENCLAW_HELPER_AGENT", "minecraft-helper"),
   modAgent: env("OPENCLAW_MOD_AGENT", "minecraft-moderation"),
