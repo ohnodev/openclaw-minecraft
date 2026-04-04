@@ -1,0 +1,16 @@
+// Copy relevant parts into ~/.openclaw/openclaw.json
+{
+  agents: {
+    defaults: {
+      model: {
+        primary: "anthropic/claude-haiku-4-5",
+      },
+      workspace: "~/.openclaw/workspace",
+    },
+    list: [
+      { id: "minecraft-router" },
+      { id: "minecraft-helper" },
+      { id: "minecraft-moderation" },
+    ],
+  },
+}

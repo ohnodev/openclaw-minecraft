@@ -1,0 +1,12 @@
+{
+  "name": "@openclaw-minecraft/sidecar",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.mjs"
+  },
+  "dependencies": {
+    "rcon-client": "^4.2.4"
+  }
+}
