@@ -44,8 +44,8 @@ const config = {
   tag: env("HEROBRINE_TAG", "@Herobrine"),
   cli: env("OPENCLAW_CLI", "openclaw"),
   model: env("OPENCLAW_MODEL", "anthropic/claude-haiku-4-5"),
-  thinking: env("OPENCLAW_THINKING", "minimal"),
-  openclawTimeoutSec: envInt("OPENCLAW_TIMEOUT_SEC", 12),
+  thinking: env("OPENCLAW_THINKING", "off"),
+  openclawTimeoutSec: envInt("OPENCLAW_TIMEOUT_SEC", 35),
   routerAgent: env("OPENCLAW_ROUTER_AGENT", "minecraft-router"),
   helperAgent: env("OPENCLAW_HELPER_AGENT", "minecraft-helper"),
   modAgent: env("OPENCLAW_MOD_AGENT", "minecraft-moderation"),
@@ -60,12 +60,26 @@ const config = {
   ambientMinMs: envInt("AMBIENT_MIN_INTERVAL_MS", 1_800_000),
   ambientMaxMs: envInt("AMBIENT_MAX_INTERVAL_MS", 3_600_000),
   ambientContextLines: envInt("AMBIENT_CONTEXT_LINES", 8),
+  dedupeWindowMs: envInt("DEDUPE_WINDOW_MS", 30_000),
+  quickAckEnabled: env("QUICK_ACK_ENABLED", "1") !== "0",
+  quickAckText: env("QUICK_ACK_TEXT", "heard."),
+  typewriterEnabled: env("TYPEWRITER_ENABLED", "1") !== "0",
+  typewriterMinDelayMs: envInt("TYPEWRITER_MIN_DELAY_MS", 30),
+  typewriterMaxDelayMs: envInt("TYPEWRITER_MAX_DELAY_MS", 90),
+  typewriterPunctPauseMs: envInt("TYPEWRITER_PUNCT_PAUSE_MS", 220),
+  typewriterMaxChars: envInt("TYPEWRITER_MAX_CHARS", 220),
 };
 
 const CHAT_RE = /^<([^>]+)>\s+(.+)$/;
 const PM_RE = /^\[CHAT_PM\]\s+from=([^\s]+)\s+from_uuid=([^\s]+)\s+cmd=([^\s]+)\s+to=([^\s]+)\s+message=(.*)$/;
-const MODERATION_RE = /\b(kick|ban|mute|punish|report|moderate|warn|stop)\b/i;
-const TARGET_RE = /\b(?:kick|ban|mute|punish|report|moderate|warn|stop)\s+(@?[A-Za-z0-9_]{1,16})\b/i;
+const REPORT_RE = /^\/?report\s+(@?[A-Za-z0-9_]{1,16})(?:\s+(.+))?$/i;
+const HEROBRINE_MENTION_PATTERNS = [
+  /\b@?herobrine\b/i,
+  /\b@?hero\s*brine\b/i,
+  /\b@?hereobrine\b/i,
+  /\b@?herobrin\b/i,
+  /\b@?herobine\b/i,
+];
 const userLastResponse = new Map();
 const byUser = new Map();
 const allMessages = [];
@@ -77,6 +91,9 @@ let tickInFlight = false;
 let nextAmbientAtMs = Date.now();
 const processedLineHashes = new Set();
 let watchDebounceTimer = null;
+const inFlightPlayers = new Set();
+const recentPromptByPlayer = new Map();
+const typewriterStreamByTarget = new Map();
 
 function hashLine(line) {
   return crypto.createHash("sha1").update(line).digest("hex");
@@ -108,7 +125,7 @@ function writeCursorState() {
   try {
     const dir = path.dirname(config.statePath);
     fs.mkdirSync(dir, { recursive: true });
-    const tmp = `${config.statePath}.tmp`;
+    const tmp = `${config.statePath}.${process.pid}.tmp`;
     const payload = JSON.stringify(
       {
         version: 1,
@@ -220,8 +237,11 @@ function getRecentGlobal(limit = 8, withinMinutes = 20) {
 }
 
 function stripTag(message) {
-  const re = new RegExp(`@?${config.tag.replace("@", "")}\\b[:,]?\\s*`, "i");
-  return message.replace(re, "").trim();
+  let out = String(message || "");
+  for (const re of HEROBRINE_MENTION_PATTERNS) {
+    out = out.replace(re, "");
+  }
+  return out.replace(/^[:,\s-]+/, "").trim();
 }
 
 function canRespond(player) {
@@ -233,6 +253,29 @@ function canRespond(player) {
   globalLastResponse = now;
   userLastResponse.set(key, now);
   return true;
+}
+
+function normalizedPromptText(msg) {
+  if (msg.kind === "pm") {
+    return String(msg.message || "").trim().toLowerCase();
+  }
+  return stripTag(msg.message).toLowerCase();
+}
+
+function isDuplicatePrompt(msg, normalizedText) {
+  if (!normalizedText) return true;
+  const key = String(msg.player || "").toLowerCase();
+  const now = Date.now();
+  const prev = recentPromptByPlayer.get(key);
+  if (prev && prev.text === normalizedText && now - prev.ts < config.dedupeWindowMs) {
+    return true;
+  }
+  recentPromptByPlayer.set(key, { text: normalizedText, ts: now });
+  if (recentPromptByPlayer.size > 5000) {
+    const firstKey = recentPromptByPlayer.keys().next().value;
+    if (firstKey) recentPromptByPlayer.delete(firstKey);
+  }
+  return false;
 }
 
 function jsonFromText(text) {
@@ -273,6 +316,8 @@ async function runOpenClaw(agent, message, sessionKey) {
     sessionKey,
     "--thinking",
     config.thinking,
+    "--verbose",
+    "off",
     "--message",
     message
   ];
@@ -312,6 +357,65 @@ async function sendWhisper(player, text) {
   await conn.send(`msg ${player} ${oneLine}`);
 }
 
+async function sendActionbar(target, text) {
+  const conn = await ensureRcon();
+  const json = JSON.stringify({ text: String(text || "") });
+  await conn.send(`title ${target} actionbar ${json}`);
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
+}
+
+function randomInt(min, max) {
+  if (max <= min) return min;
+  return min + Math.floor(Math.random() * (max - min + 1));
+}
+
+function clampTypewriterText(fullText) {
+  const oneLine = String(fullText || "").replace(/\r?\n/g, " ").trim();
+  const maxChars = Math.max(20, config.typewriterMaxChars);
+  return oneLine.length <= maxChars ? oneLine : oneLine.slice(0, maxChars);
+}
+
+function beginTypewriterStream(target) {
+  const nextId = (typewriterStreamByTarget.get(target) ?? 0) + 1;
+  typewriterStreamByTarget.set(target, nextId);
+  return nextId;
+}
+
+function isTypewriterCancelled(target, streamId) {
+  return typewriterStreamByTarget.get(target) !== streamId;
+}
+
+async function streamTypewriter(target, fullText) {
+  const streamId = beginTypewriterStream(target);
+  const text = clampTypewriterText(fullText);
+  if (!text) return;
+
+  const minDelay = Math.max(5, config.typewriterMinDelayMs);
+  const maxDelay = Math.max(minDelay, config.typewriterMaxDelayMs);
+  const punctPause = Math.max(0, config.typewriterPunctPauseMs);
+
+  let rendered = "";
+  for (const ch of text) {
+    if (isTypewriterCancelled(target, streamId)) return;
+    rendered += ch;
+    await sendActionbar(target, rendered);
+
+    const delay = randomInt(minDelay, maxDelay);
+    const extra = /[.,!?…]/.test(ch) ? punctPause : 0;
+    await sleep(delay + extra);
+  }
+}
+
+async function sendQuickAck(msg) {
+  if (!config.quickAckEnabled) return;
+  const text = String(config.quickAckText || "").trim();
+  if (!text) return;
+  await sendWhisper(msg.player, `[Herobrine] ${text}`);
+}
+
 async function warnPlayer(player, reason) {
   const conn = await ensureRcon();
   const json = JSON.stringify([
@@ -332,60 +436,58 @@ function isPmTargetForHerobrine(target) {
 }
 
 function isMessageForHerobrine(message) {
-  const name = String(config.tag || "@Herobrine").replace(/^@/, "").toLowerCase();
-  const re = new RegExp(`\\b@?${name}\\b`, "i");
-  return re.test(String(message || ""));
+  const text = String(message || "");
+  return HEROBRINE_MENTION_PATTERNS.some((re) => re.test(text));
 }
 
 async function replyAsHerobrine(msg, text) {
   const line = `[Herobrine] ${text}`;
+  const target = msg.kind === "pm" ? msg.player : "@a";
+
+  if (config.typewriterEnabled) {
+    try {
+      await streamTypewriter(target, line);
+    } catch (err) {
+      console.warn("[minecraft-sidecar] typewriter failed, falling back to final message:", err);
+    }
+  }
+
   if (msg.kind === "pm") {
-    await sendWhisper(msg.player, line);
+    await sendWhisper(target, line);
   } else {
-    await sendTellraw("@a", line);
+    await sendTellraw(target, line);
   }
 }
 
 async function routeAndHandle(msg) {
   const stripped = stripTag(msg.message);
   if (!stripped) return;
+  const reportMatch = stripped.match(REPORT_RE);
+  if (reportMatch) {
+    const target = String(reportMatch[1] || "").replace(/^@/, "");
+    const reason = String(reportMatch[2] || "reported by a player").trim();
+    if (!target) {
+      await replyAsHerobrine(msg, "usage: /report <player> <reason>");
+      return;
+    }
+    await warnPlayer(target, `reported: ${reason.slice(0, 180)}`);
+    await replyAsHerobrine(msg, `report noted for ${target}.`);
+    return;
+  }
+
   const chatSessionKey = sessionKeyForMessage(msg);
-
-  if (!MODERATION_RE.test(stripped)) {
-    const helperInput = `player=${msg.player}\nmessage=${stripped}`;
-    const helperRaw = await runOpenClaw(config.helperAgent, helperInput, chatSessionKey);
-    const oneLine = extractAssistantLine(helperRaw);
-    if (oneLine) await replyAsHerobrine(msg, oneLine);
-    return;
-  }
-
-  const targetMatch = stripped.match(TARGET_RE);
-  const target = targetMatch ? targetMatch[1].replace(/^@/, "") : null;
-  if (!target) {
-    await replyAsHerobrine(msg, "need a name.");
-    return;
-  }
-  const evidence = getRecent(target)
-    .map((m) => `[${m.timestamp}] <${m.player}> ${m.message}`)
+  const recent = getRecent(msg.player)
+    .slice(-6)
+    .map((m) => `<${m.player}> ${m.message}`)
     .join("\n");
-  const modInput = `requester=${msg.player}\ntarget=${target}\nmessage=${stripped}\n\nevidence:\n${evidence || "(none)"}`;
-  const modSessionKey = `mc_mod_${target.toLowerCase().replace(/[^a-z0-9_-]/g, "_")}`;
-  const modRaw = await runOpenClaw(config.modAgent, modInput, modSessionKey);
-  const decision = jsonFromText(modRaw);
-  if (!decision || decision.action === "ignore") {
-    const resp = decision?.response || "nothing to see.";
-    await replyAsHerobrine(msg, resp);
-    return;
-  }
-  if (decision.action === "warn") {
-    await warnPlayer(target, decision.reason || "watch yourself.");
-    await replyAsHerobrine(msg, decision.response || "last chance.");
-    return;
-  }
-  if (decision.action === "kick") {
-    await kickPlayer(target, decision.reason || "removed.");
-    await replyAsHerobrine(msg, decision.response || "gone.");
-  }
+  const helperInput =
+    `player=${msg.player}\n` +
+    `kind=${msg.kind}\n` +
+    `message=${stripped}\n` +
+    `recent:\n${recent || "(none)"}`;
+  const helperRaw = await runOpenClaw(config.helperAgent, helperInput, chatSessionKey);
+  const oneLine = extractAssistantLine(helperRaw);
+  if (oneLine) await replyAsHerobrine(msg, oneLine);
 }
 
 function randomAmbientIntervalMs() {
@@ -457,11 +559,19 @@ async function tick() {
     } else if (!isMessageForHerobrine(msg.message)) {
       continue;
     }
+    const normalizedText = normalizedPromptText(msg);
+    if (isDuplicatePrompt(msg, normalizedText)) continue;
+    const playerKey = String(msg.player || "").toLowerCase();
+    if (inFlightPlayers.has(playerKey)) continue;
     if (!canRespond(msg.player)) continue;
+    inFlightPlayers.add(playerKey);
     try {
+      await sendQuickAck(msg);
       await routeAndHandle(msg);
     } catch (err) {
       console.error("[minecraft-sidecar] handler error:", err);
+    } finally {
+      inFlightPlayers.delete(playerKey);
     }
   }
 
