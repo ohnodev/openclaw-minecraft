@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import crypto from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
@@ -36,10 +37,14 @@ loadEnvFile(path.resolve(__dirname, "..", ".env"));
 
 const config = {
   mcLogPath: env("MC_LOG_PATH", "/root/minecraft-cabal/server/logs/latest.log"),
-  pollMs: envInt("POLL_INTERVAL_MS", 5000),
+  statePath: env("STATE_PATH", path.resolve(__dirname, "..", ".state", "cursor.json")),
+  pollMs: envInt("POLL_INTERVAL_MS", 1000),
+  followMode: env("FOLLOW_MODE", "watch").toLowerCase(),
+  fallbackPollMs: envInt("FALLBACK_POLL_MS", 2000),
   tag: env("HEROBRINE_TAG", "@Herobrine"),
   cli: env("OPENCLAW_CLI", "openclaw"),
   model: env("OPENCLAW_MODEL", "anthropic/claude-haiku-4-5"),
+  thinking: env("OPENCLAW_THINKING", "minimal"),
   routerAgent: env("OPENCLAW_ROUTER_AGENT", "minecraft-router"),
   helperAgent: env("OPENCLAW_HELPER_AGENT", "minecraft-helper"),
   modAgent: env("OPENCLAW_MOD_AGENT", "minecraft-moderation"),
@@ -50,27 +55,138 @@ const config = {
   globalCooldownMs: envInt("GLOBAL_COOLDOWN_MS", 2000),
   bufferMax: envInt("MESSAGE_BUFFER_MAX", 50),
   bufferWindowMin: envInt("MESSAGE_BUFFER_WINDOW_MIN", 15),
+  ambientEnabled: env("AMBIENT_ENABLED", "1") !== "0",
+  ambientMinMs: envInt("AMBIENT_MIN_INTERVAL_MS", 1_800_000),
+  ambientMaxMs: envInt("AMBIENT_MAX_INTERVAL_MS", 3_600_000),
+  ambientContextLines: envInt("AMBIENT_CONTEXT_LINES", 8),
 };
 
-const routerPrompt = fs.readFileSync(path.resolve(__dirname, "..", "prompts", "router.md"), "utf8");
 const helperPrompt = fs.readFileSync(path.resolve(__dirname, "..", "prompts", "helper.md"), "utf8");
 const modPrompt = fs.readFileSync(path.resolve(__dirname, "..", "prompts", "moderation.md"), "utf8");
 
-const CHAT_RE = /^\[[^\]]+\]: <([^>]+)>\s+(.+)$/;
+const CHAT_RE = /^<([^>]+)>\s+(.+)$/;
+const PM_RE = /^\[CHAT_PM\]\s+from=([^\s]+)\s+from_uuid=([^\s]+)\s+cmd=([^\s]+)\s+to=([^\s]+)\s+message=(.*)$/;
+const MODERATION_RE = /\b(kick|ban|mute|punish|report|moderate|warn|stop)\b/i;
+const TARGET_RE = /\b(?:kick|ban|mute|punish|report|moderate|warn|stop)\s+(@?[A-Za-z0-9_]{1,16})\b/i;
 const userLastResponse = new Map();
 const byUser = new Map();
+const allMessages = [];
 let globalLastResponse = 0;
 let fileOffset = 0;
 let fileInode = 0;
 let rconClient = null;
+let tickInFlight = false;
+let nextAmbientAtMs = Date.now();
+const processedLineHashes = new Set();
+let watchDebounceTimer = null;
+
+function hashLine(line) {
+  return crypto.createHash("sha1").update(line).digest("hex");
+}
+
+function rememberLineHash(hash) {
+  processedLineHashes.add(hash);
+  if (processedLineHashes.size > 2000) {
+    const first = processedLineHashes.values().next().value;
+    if (first) processedLineHashes.delete(first);
+  }
+}
+
+function readCursorState() {
+  try {
+    const raw = fs.readFileSync(config.statePath, "utf8");
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return null;
+    const inode = Number(parsed.inode);
+    const offset = Number(parsed.offset);
+    if (!Number.isFinite(inode) || !Number.isFinite(offset) || inode <= 0 || offset < 0) return null;
+    return { inode, offset };
+  } catch {
+    return null;
+  }
+}
+
+function writeCursorState() {
+  try {
+    const dir = path.dirname(config.statePath);
+    fs.mkdirSync(dir, { recursive: true });
+    const tmp = `${config.statePath}.tmp`;
+    const payload = JSON.stringify(
+      {
+        version: 1,
+        inode: fileInode,
+        offset: fileOffset,
+        updatedAt: new Date().toISOString(),
+      },
+      null,
+      2
+    );
+    fs.writeFileSync(tmp, payload);
+    fs.renameSync(tmp, config.statePath);
+  } catch (err) {
+    console.error("[minecraft-sidecar] failed writing cursor state:", err);
+  }
+}
+
+function initializeCursor() {
+  try {
+    const st = fs.statSync(config.mcLogPath);
+    const saved = readCursorState();
+    fileInode = st.ino;
+    if (saved && saved.inode === st.ino && saved.offset >= 0 && saved.offset <= st.size) {
+      fileOffset = saved.offset;
+      return;
+    }
+    // Fresh start or rotated/truncated file: start at end to avoid replay spam.
+    fileOffset = st.size;
+    writeCursorState();
+  } catch (err) {
+    console.error("[minecraft-sidecar] failed initializing cursor:", err);
+    fileInode = 0;
+    fileOffset = 0;
+  }
+}
 
 function parseLine(line) {
   const idx = line.indexOf("] [Server thread/INFO]: ");
   if (idx < 0) return null;
   const payload = line.slice(idx + "] [Server thread/INFO]: ".length);
-  const m = payload.match(CHAT_RE);
-  if (!m) return null;
-  return { player: m[1], message: m[2], timestamp: new Date().toISOString() };
+  if (payload.startsWith("{")) {
+    try {
+      const obj = JSON.parse(payload);
+      if (obj && obj.event === "CHAT_PM" && obj.from && obj.to) {
+        return {
+          kind: "pm",
+          player: String(obj.from),
+          message: String(obj.message ?? ""),
+          target: String(obj.to),
+          timestamp: new Date().toISOString(),
+        };
+      }
+    } catch {
+      // ignore non-JSON payloads
+    }
+  }
+  const chat = payload.match(CHAT_RE);
+  if (chat) {
+    return {
+      kind: "chat",
+      player: chat[1],
+      message: chat[2],
+      timestamp: new Date().toISOString(),
+    };
+  }
+  const pm = payload.match(PM_RE);
+  if (pm) {
+    return {
+      kind: "pm",
+      player: pm[1],
+      message: pm[5] ?? "",
+      target: pm[4],
+      timestamp: new Date().toISOString(),
+    };
+  }
+  return null;
 }
 
 function pushMessage(msg) {
@@ -80,6 +196,15 @@ function pushMessage(msg) {
   const max = config.bufferMax;
   if (arr.length > max) arr.splice(0, arr.length - max);
   byUser.set(key, arr);
+
+  allMessages.push(msg);
+  const cutoff = Date.now() - Math.max(config.bufferWindowMin, 60) * 60_000;
+  while (allMessages.length > 0 && Date.parse(allMessages[0].timestamp) < cutoff) {
+    allMessages.shift();
+  }
+  if (allMessages.length > 2000) {
+    allMessages.splice(0, allMessages.length - 2000);
+  }
 }
 
 function getRecent(player) {
@@ -87,6 +212,13 @@ function getRecent(player) {
   const arr = byUser.get(key) ?? [];
   const cutoff = Date.now() - config.bufferWindowMin * 60_000;
   return arr.filter((m) => Date.parse(m.timestamp) >= cutoff).slice(-20);
+}
+
+function getRecentGlobal(limit = 8, withinMinutes = 20) {
+  const cutoff = Date.now() - withinMinutes * 60_000;
+  return allMessages
+    .filter((m) => Date.parse(m.timestamp) >= cutoff)
+    .slice(-Math.max(1, limit));
 }
 
 function stripTag(message) {
@@ -115,13 +247,33 @@ function jsonFromText(text) {
   }
 }
 
-async function runOpenClaw(agent, message) {
+function extractAssistantLine(raw) {
+  const lines = String(raw || "")
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+  const filtered = lines.filter(
+    (l) => !l.startsWith("[tools]") && !l.startsWith("⚠️") && !l.startsWith("Gateway ")
+  );
+  const pool = filtered.length > 0 ? filtered : lines;
+  return pool.length > 0 ? pool[pool.length - 1] : "";
+}
+
+function sessionKeyForMessage(msg) {
+  const player = String(msg.player || "unknown").toLowerCase();
+  return msg.kind === "pm" ? `mc-pm:${player}` : `mc-public:${player}`;
+}
+
+async function runOpenClaw(agent, message, sessionKey) {
   const args = [
     "agent",
+    "--local",
     "--agent",
     agent,
-    "--model",
-    config.model,
+    "--to",
+    sessionKey,
+    "--thinking",
+    config.thinking,
     "--message",
     message,
   ];
@@ -148,6 +300,12 @@ async function sendTellraw(target, text) {
   await conn.send(`tellraw ${target} ${json}`);
 }
 
+async function sendWhisper(player, text) {
+  const conn = await ensureRcon();
+  const oneLine = String(text).replace(/\r?\n/g, " ").trim();
+  await conn.send(`msg ${player} ${oneLine}`);
+}
+
 async function warnPlayer(player, reason) {
   const conn = await ensureRcon();
   const json = JSON.stringify([
@@ -162,48 +320,94 @@ async function kickPlayer(player, reason) {
   await conn.send(`kick ${player} ${reason}`);
 }
 
+function isPmTargetForHerobrine(target) {
+  const normalize = (s) => String(s || "").replace(/^@/, "").toLowerCase();
+  return normalize(target) === normalize(config.tag);
+}
+
+function isMessageForHerobrine(message) {
+  const name = String(config.tag || "@Herobrine").replace(/^@/, "").toLowerCase();
+  const re = new RegExp(`\\b@?${name}\\b`, "i");
+  return re.test(String(message || ""));
+}
+
+async function replyAsHerobrine(msg, text) {
+  const line = `[Herobrine] ${text}`;
+  if (msg.kind === "pm") {
+    await sendWhisper(msg.player, line);
+  } else {
+    await sendTellraw("@a", line);
+  }
+}
+
 async function routeAndHandle(msg) {
   const stripped = stripTag(msg.message);
-  const routerInput = `${routerPrompt}\n\nrequester=${msg.player}\nmessage=${stripped}`;
-  const routerRaw = await runOpenClaw(config.routerAgent, routerInput);
-  const route = jsonFromText(routerRaw);
-  if (!route || route.route === "ignore") return;
+  if (!stripped) return;
+  const chatSessionKey = sessionKeyForMessage(msg);
 
-  if (route.route === "helper") {
+  if (!MODERATION_RE.test(stripped)) {
     const helperInput = `${helperPrompt}\n\nplayer=${msg.player}\nmessage=${stripped}`;
-    const helperRaw = await runOpenClaw(config.helperAgent, helperInput);
-    const oneLine = helperRaw.split(/\r?\n/).find((x) => x.trim())?.trim();
-    if (oneLine) await sendTellraw("@a", `[Herobrine] ${oneLine}`);
+    const helperRaw = await runOpenClaw(config.helperAgent, helperInput, chatSessionKey);
+    const oneLine = extractAssistantLine(helperRaw);
+    if (oneLine) await replyAsHerobrine(msg, oneLine);
     return;
   }
 
-  if (route.route === "moderation") {
-    const target = route.target;
-    if (!target) {
-      await sendTellraw("@a", "[Herobrine] need a name.");
-      return;
-    }
-    const evidence = getRecent(target)
-      .map((m) => `[${m.timestamp}] <${m.player}> ${m.message}`)
-      .join("\n");
-    const modInput = `${modPrompt}\n\nrequester=${msg.player}\ntarget=${target}\nmessage=${stripped}\n\nevidence:\n${evidence || "(none)"}`;
-    const modRaw = await runOpenClaw(config.modAgent, modInput);
-    const decision = jsonFromText(modRaw);
-    if (!decision || decision.action === "ignore") {
-      const resp = decision?.response || "nothing to see.";
-      await sendTellraw("@a", `[Herobrine] ${resp}`);
-      return;
-    }
-    if (decision.action === "warn") {
-      await warnPlayer(target, decision.reason || "watch yourself.");
-      await sendTellraw("@a", `[Herobrine] ${decision.response || "last chance."}`);
-      return;
-    }
-    if (decision.action === "kick") {
-      await kickPlayer(target, decision.reason || "removed.");
-      await sendTellraw("@a", `[Herobrine] ${decision.response || "gone."}`);
-    }
+  const targetMatch = stripped.match(TARGET_RE);
+  const target = targetMatch ? targetMatch[1].replace(/^@/, "") : null;
+  if (!target) {
+    await replyAsHerobrine(msg, "need a name.");
+    return;
   }
+  const evidence = getRecent(target)
+    .map((m) => `[${m.timestamp}] <${m.player}> ${m.message}`)
+    .join("\n");
+  const modInput = `${modPrompt}\n\nrequester=${msg.player}\ntarget=${target}\nmessage=${stripped}\n\nevidence:\n${evidence || "(none)"}`;
+  const modSessionKey = `mc-mod:${target.toLowerCase()}`;
+  const modRaw = await runOpenClaw(config.modAgent, modInput, modSessionKey);
+  const decision = jsonFromText(modRaw);
+  if (!decision || decision.action === "ignore") {
+    const resp = decision?.response || "nothing to see.";
+    await replyAsHerobrine(msg, resp);
+    return;
+  }
+  if (decision.action === "warn") {
+    await warnPlayer(target, decision.reason || "watch yourself.");
+    await replyAsHerobrine(msg, decision.response || "last chance.");
+    return;
+  }
+  if (decision.action === "kick") {
+    await kickPlayer(target, decision.reason || "removed.");
+    await replyAsHerobrine(msg, decision.response || "gone.");
+  }
+}
+
+function randomAmbientIntervalMs() {
+  const min = Math.max(60_000, config.ambientMinMs);
+  const max = Math.max(min, config.ambientMaxMs);
+  if (max === min) return min;
+  return min + Math.floor(Math.random() * (max - min + 1));
+}
+
+function scheduleNextAmbient() {
+  nextAmbientAtMs = Date.now() + randomAmbientIntervalMs();
+}
+
+async function maybeSendAmbientLine() {
+  if (!config.ambientEnabled) return;
+  const now = Date.now();
+  if (now < nextAmbientAtMs) return;
+  scheduleNextAmbient();
+
+  const context = getRecentGlobal(config.ambientContextLines, 20);
+  if (context.length === 0) return;
+
+  const contextLines = context.map((m) => `<${m.player}> ${m.message}`).join("\n");
+  const prompt = `${helperPrompt}\n\nWrite one ambient Herobrine line for the whole server based on this recent chat context.\nDo not mention policy. Keep it one line.\n\nRecent chat:\n${contextLines}`;
+  const raw = await runOpenClaw(config.helperAgent, prompt, "mc-ambient:global");
+  const oneLine = extractAssistantLine(raw);
+  if (!oneLine) return;
+  await sendTellraw("@a", `[Herobrine] ${oneLine}`);
 }
 
 function readNewLines() {
@@ -222,6 +426,7 @@ function readNewLines() {
     fs.readSync(fd, buf, 0, len, fileOffset);
     fs.closeSync(fd);
     fileOffset = st.size;
+    writeCursorState();
     return buf.toString("utf8").split(/\r?\n/).filter(Boolean);
   } catch {
     return [];
@@ -231,10 +436,18 @@ function readNewLines() {
 async function tick() {
   const lines = readNewLines();
   for (const line of lines) {
+    const lineHash = hashLine(line);
+    if (processedLineHashes.has(lineHash)) continue;
+    rememberLineHash(lineHash);
+
     const msg = parseLine(line);
     if (!msg) continue;
     pushMessage(msg);
-    if (!msg.message.toLowerCase().includes(config.tag.toLowerCase())) continue;
+    if (msg.kind === "pm") {
+      if (!isPmTargetForHerobrine(msg.target)) continue;
+    } else if (!isMessageForHerobrine(msg.message)) {
+      continue;
+    }
     if (!canRespond(msg.player)) continue;
     try {
       await routeAndHandle(msg);
@@ -242,13 +455,60 @@ async function tick() {
       console.error("[minecraft-sidecar] handler error:", err);
     }
   }
+
+  try {
+    await maybeSendAmbientLine();
+  } catch (err) {
+    console.error("[minecraft-sidecar] ambient error:", err);
+  }
+}
+
+function requestTick() {
+  if (tickInFlight) return;
+  tickInFlight = true;
+  void tick().finally(() => {
+    tickInFlight = false;
+  });
+}
+
+function startWatcher() {
+  const logDir = path.dirname(config.mcLogPath);
+  const logFile = path.basename(config.mcLogPath);
+  try {
+    const watcher = fs.watch(logDir, (eventType, filename) => {
+      const changed = filename ? String(filename) : "";
+      if (changed && changed !== logFile) return;
+      if (watchDebounceTimer) {
+        clearTimeout(watchDebounceTimer);
+      }
+      watchDebounceTimer = setTimeout(() => {
+        watchDebounceTimer = null;
+        requestTick();
+      }, 50);
+    });
+    watcher.on("error", (err) => {
+      console.error("[minecraft-sidecar] file watch error:", err);
+    });
+    console.log(`[minecraft-sidecar] follow mode: watch (${logDir}/${logFile})`);
+  } catch (err) {
+    console.error("[minecraft-sidecar] failed to start file watch:", err);
+  }
 }
 
 console.log("[minecraft-sidecar] starting");
 console.log(`  log: ${config.mcLogPath}`);
 console.log(`  model: ${config.model}`);
 console.log(`  agents: ${config.routerAgent}, ${config.helperAgent}, ${config.modAgent}`);
-setInterval(() => {
-  void tick();
-}, config.pollMs);
+initializeCursor();
+scheduleNextAmbient();
+
+if (config.followMode === "watch") {
+  startWatcher();
+}
+
+const intervalMs = config.followMode === "watch" ? Math.max(250, config.fallbackPollMs) : Math.max(250, config.pollMs);
+setInterval(requestTick, intervalMs);
+
+// Run one immediate pass on startup.
+requestTick();
 
