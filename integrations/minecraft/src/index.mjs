@@ -67,11 +67,20 @@ const CHAT_RE = /^<([^>]+)>\s+(.+)$/;
 const PM_RE = /^\[CHAT_PM\]\s+from=([^\s]+)\s+from_uuid=([^\s]+)\s+cmd=([^\s]+)\s+to=([^\s]+)\s+message=(.*)$/;
 const REPORT_RE = /^\/?report\s+(@?[A-Za-z0-9_]{1,16})(?:\s+(.+))?$/i;
 const HEROBRINE_MENTION_PATTERNS = [
-  /\b@?herobrine\b/i,
-  /\b@?hero\s*brine\b/i,
-  /\b@?hereobrine\b/i,
-  /\b@?herobrin\b/i,
-  /\b@?herobine\b/i,
+  /(^|\s)@?herobrine(?=\s|$|[?!.,:;])/i,
+  /(^|\s)@?hereobrine(?=\s|$|[?!.,:;])/i,
+  /(^|\s)@?herobrin(?:e)?(?=\s|$|[?!.,:;])/i,
+  /(^|\s)@?herobine(?=\s|$|[?!.,:;])/i,
+  /(^|\s)@?hero\s*brine(?=\s|$|[?!.,:;])/i,
+  /(^|\s)@?hero\s*brin(?=\s|$|[?!.,:;])/i,
+];
+const HEROBRINE_STRIP_PATTERNS = [
+  /(^|\s)@?herobrine(?=\s|$|[?!.,:;])/gi,
+  /(^|\s)@?hereobrine(?=\s|$|[?!.,:;])/gi,
+  /(^|\s)@?herobrin(?:e)?(?=\s|$|[?!.,:;])/gi,
+  /(^|\s)@?herobine(?=\s|$|[?!.,:;])/gi,
+  /(^|\s)@?hero\s*brine(?=\s|$|[?!.,:;])/gi,
+  /(^|\s)@?hero\s*brin(?=\s|$|[?!.,:;])/gi,
 ];
 const userLastResponse = new Map();
 const byUser = new Map();
@@ -230,10 +239,10 @@ function getRecentGlobal(limit = 8, withinMinutes = 20) {
 
 function stripTag(message) {
   let out = String(message || "");
-  for (const re of HEROBRINE_MENTION_PATTERNS) {
+  for (const re of HEROBRINE_STRIP_PATTERNS) {
     out = out.replace(re, "");
   }
-  return out.replace(/^[:,\s-]+/, "").trim();
+  return out.replace(/^[:,\s-]+/, "").replace(/\s+/g, " ").trim();
 }
 
 function canRespond(player) {
@@ -386,7 +395,10 @@ async function replyAsHerobrine(msg, text) {
 
 async function routeAndHandle(msg) {
   const stripped = stripTag(msg.message);
-  if (!stripped) return;
+  const promptMessage =
+    stripped.length > 0
+      ? stripped
+      : "The player called your name directly without extra text. Reply briefly in-character.";
   const reportMatch = stripped.match(REPORT_RE);
   if (reportMatch) {
     const target = String(reportMatch[1] || "").replace(/^@/, "");
@@ -408,7 +420,7 @@ async function routeAndHandle(msg) {
   const helperInput =
     `player=${msg.player}\n` +
     `kind=${msg.kind}\n` +
-    `message=${stripped}\n` +
+    `message=${promptMessage}\n` +
     `recent:\n${recent || "(none)"}`;
   const helperRaw = await runOpenClaw(config.helperAgent, helperInput, chatSessionKey);
   const oneLine = extractAssistantLine(helperRaw);
