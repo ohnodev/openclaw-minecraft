@@ -382,6 +382,36 @@ function isMessageForHerobrine(message) {
   return HEROBRINE_MENTION_PATTERNS.some((re) => re.test(text));
 }
 
+function maybeInstantReply(messageText) {
+  const normalized = String(messageText || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!normalized) {
+    return "I am here.";
+  }
+  if (
+    normalized === "hi" ||
+    normalized === "hello" ||
+    normalized === "hey" ||
+    normalized === "yo" ||
+    normalized === "sup" ||
+    normalized === "wassup"
+  ) {
+    return "I am here.";
+  }
+  if (
+    normalized === "you there" ||
+    normalized === "are you there" ||
+    normalized === "herobrine you there" ||
+    normalized === "herobrine are you there"
+  ) {
+    return "Always watching.";
+  }
+  return null;
+}
+
 async function replyAsHerobrine(msg, text) {
   const line = `[Herobrine] ${text}`;
   const target = msg.kind === "pm" ? msg.player : "@a";
@@ -399,6 +429,11 @@ async function routeAndHandle(msg) {
     stripped.length > 0
       ? stripped
       : "The player called your name directly without extra text. Reply briefly in-character.";
+  const instant = maybeInstantReply(stripped);
+  if (instant) {
+    await replyAsHerobrine(msg, instant);
+    return;
+  }
   const reportMatch = stripped.match(REPORT_RE);
   if (reportMatch) {
     const target = String(reportMatch[1] || "").replace(/^@/, "");
@@ -422,7 +457,10 @@ async function routeAndHandle(msg) {
     `kind=${msg.kind}\n` +
     `message=${promptMessage}\n` +
     `recent:\n${recent || "(none)"}`;
+  const modelStartMs = Date.now();
   const helperRaw = await runOpenClaw(config.helperAgent, helperInput, chatSessionKey);
+  const modelElapsedMs = Date.now() - modelStartMs;
+  console.log(`[minecraft-sidecar] helper latency_ms=${modelElapsedMs} player=${msg.player} kind=${msg.kind}`);
   const oneLine = extractAssistantLine(helperRaw);
   if (oneLine) await replyAsHerobrine(msg, oneLine);
 }
