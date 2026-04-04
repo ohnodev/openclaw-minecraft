@@ -45,6 +45,8 @@ const config = {
   cli: env("OPENCLAW_CLI", "openclaw"),
   model: env("OPENCLAW_MODEL", "anthropic/claude-haiku-4-5"),
   thinking: env("OPENCLAW_THINKING", "minimal"),
+  openclawTimeoutSec: envInt("OPENCLAW_TIMEOUT_SEC", 12),
+  useLocal: env("OPENCLAW_USE_LOCAL", "0") === "1",
   routerAgent: env("OPENCLAW_ROUTER_AGENT", "minecraft-router"),
   helperAgent: env("OPENCLAW_HELPER_AGENT", "minecraft-helper"),
   modAgent: env("OPENCLAW_MOD_AGENT", "minecraft-moderation"),
@@ -265,20 +267,31 @@ function sessionKeyForMessage(msg) {
 }
 
 async function runOpenClaw(agent, message, sessionKey) {
-  const args = [
-    "agent",
-    "--local",
+  const args = ["agent"];
+  if (config.useLocal) {
+    args.push("--local");
+  }
+  args.push(
     "--agent",
     agent,
-    "--to",
+    "--session-id",
     sessionKey,
     "--thinking",
     config.thinking,
     "--message",
-    message,
-  ];
-  const { stdout } = await execFileAsync(config.cli, args, { maxBuffer: 1024 * 1024 });
+    message
+  );
+  const { stdout } = await execFileAsync(config.cli, args, {
+    maxBuffer: 1024 * 1024,
+    timeout: Math.max(5, config.openclawTimeoutSec) * 1000,
+  });
   return (stdout || "").trim();
+}
+
+function isSimplePresencePing(text) {
+  const t = String(text || "").toLowerCase().trim();
+  if (!t) return false;
+  return /^(are you there[\?\!]*|you there[\?\!]*|hello|hi|yo|check|test)$/.test(t);
 }
 
 async function ensureRcon() {
@@ -346,10 +359,19 @@ async function routeAndHandle(msg) {
   const chatSessionKey = sessionKeyForMessage(msg);
 
   if (!MODERATION_RE.test(stripped)) {
+    // Skip LLM round-trip for simple "are you there" pings.
+    if (isSimplePresencePing(stripped)) {
+      await replyAsHerobrine(msg, "present.");
+      return;
+    }
     const helperInput = `${helperPrompt}\n\nplayer=${msg.player}\nmessage=${stripped}`;
-    const helperRaw = await runOpenClaw(config.helperAgent, helperInput, chatSessionKey);
-    const oneLine = extractAssistantLine(helperRaw);
-    if (oneLine) await replyAsHerobrine(msg, oneLine);
+    try {
+      const helperRaw = await runOpenClaw(config.helperAgent, helperInput, chatSessionKey);
+      const oneLine = extractAssistantLine(helperRaw);
+      if (oneLine) await replyAsHerobrine(msg, oneLine);
+    } catch {
+      await replyAsHerobrine(msg, "the fog is loud. ask again.");
+    }
     return;
   }
 
@@ -364,7 +386,13 @@ async function routeAndHandle(msg) {
     .join("\n");
   const modInput = `${modPrompt}\n\nrequester=${msg.player}\ntarget=${target}\nmessage=${stripped}\n\nevidence:\n${evidence || "(none)"}`;
   const modSessionKey = `mc-mod:${target.toLowerCase()}`;
-  const modRaw = await runOpenClaw(config.modAgent, modInput, modSessionKey);
+  let modRaw = "";
+  try {
+    modRaw = await runOpenClaw(config.modAgent, modInput, modSessionKey);
+  } catch {
+    await replyAsHerobrine(msg, "the signal is thin. try again.");
+    return;
+  }
   const decision = jsonFromText(modRaw);
   if (!decision || decision.action === "ignore") {
     const resp = decision?.response || "nothing to see.";
