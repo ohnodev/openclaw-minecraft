@@ -486,7 +486,7 @@ class GatewaySessionInvokeTest {
     val deviceAuthStore = InMemoryDeviceAuthStore()
     val session =
       GatewaySession(
-        scope = CoroutineScope(sessionJob + Dispatchers.Default),
+        scope = CoroutineScope(sessionJob + Dispatchers.Default.limitedParallelism(1)),
         identityStore = DeviceIdentityStore(app),
         deviceAuthStore = deviceAuthStore,
         onConnected = { _, _, _ ->
